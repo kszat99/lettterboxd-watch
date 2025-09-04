@@ -1,7 +1,9 @@
 name: Letterboxd Watch (Phase 2)
 
 on:
-  workflow_dispatch: {}   # manually for now
+  schedule:
+    - cron: "00 7 * * *" 
+  workflow_dispatch: {}
 
 permissions:
   contents: write
