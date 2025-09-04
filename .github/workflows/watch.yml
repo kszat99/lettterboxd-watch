@@ -1,0 +1,43 @@
+name: Letterboxd Watch (Phase 2)
+
+on:
+  workflow_dispatch: {}   # manually for now
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run watcher (fetch RSS, email, write state)
+        env:
+          LBX_FEED_URL:        ${{ secrets.LBX_FEED_URL }}
+          LBX_USER:            ${{ secrets.LBX_USER }}
+          GMAIL_USER:          ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_TO:            ${{ secrets.EMAIL_TO }}
+        run: python letterboxd_watch.py
+
+      - name: Commit state if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add data/state.json
+            git commit -m "Update state.json [skip ci]"
+            git push
+          else
+            echo "No changes to commit."
+          fi
