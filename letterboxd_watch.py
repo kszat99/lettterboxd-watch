@@ -32,7 +32,7 @@ def save_state(state):
     with STATE_PATH.open("w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
-# --- FEED UTILS ---
+# --- helpers ---
 def parse_dt(entry):
     t = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
     if not t:
@@ -47,17 +47,28 @@ def _entry_html(e):
             html = content[0]["value"]
     return html or ""
 
+def _get_letterboxd_attr(e, name):
+    """
+    feedparser zamienia 'letterboxd:memberRating' -> 'letterboxd_memberrating' (lowercase).
+    """
+    return getattr(e, f"letterboxd_{name}".lower(), None)
+
+def stars_from_numeric(val_str):
+    """'3.5' -> '★★★½'"""
+    try:
+        x = float(val_str)
+    except Exception:
+        return None
+    full = int(x)
+    half = abs(x - full) >= 0.5 - 1e-9
+    return "★" * full + ("½" if half else "")
+
 def parse_rating_from_title(title: str) -> str | None:
-    """
-    Letterboxd RSS titles often end with ' - ★★½'. Extract that suffix.
-    """
     if not title:
         return None
-    # take the part after the last ' - ' if it contains a star
     parts = title.rsplit(" - ", 1)
     if len(parts) == 2 and ("★" in parts[1] or "½" in parts[1]):
         return parts[1].strip()
-    # fallback: collect star chars
     stars = "".join(ch for ch in title if ch in "★½")
     return stars if stars else None
 
@@ -72,90 +83,74 @@ def fetch_items(url):
             "url": getattr(e, "link", ""),
             "published_at": parse_dt(e),
             "raw_html": _entry_html(e),
+            # namespaced fields:
+            "lbx_rewatch": _get_letterboxd_attr(e, "rewatch"),               # 'Yes' / 'No'
+            "lbx_member_rating": _get_letterboxd_attr(e, "memberrating"),    # e.g. '3.5'
+            "lbx_watched_date": _get_letterboxd_attr(e, "watcheddate"),      # e.g. '2025-09-01'
+            "lbx_film_title": _get_letterboxd_attr(e, "filmtitle"),
+            "lbx_film_year": _get_letterboxd_attr(e, "filmyear"),
         })
     items.sort(key=lambda i: i["published_at"] or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     return items
 
-def detect_kind_and_text(raw_html: str):
+def detect_kind_and_text(item):
     """
-    Returns (kind, text_plain, poster_url, meta_lines)
-    kind ∈ {rewatch, watched, review, list, activity}
-    meta_lines are short lines like 'Watched on ...' / 'Rewatched on ...'
+    Base action (watched/rewatch/list) from namespaced fields/URL.
+    Review presence from remaining text content.
+    Returns (kind, text_plain, poster_url, has_review)
     """
+    raw_html = item.get("raw_html", "") or ""
+    soup = BeautifulSoup(raw_html, "html.parser") if raw_html else None
+
     poster_url = None
     text_plain = ""
-    kind = "activity"
-    meta_lines = []
+    has_review = False
 
-    if not raw_html:
-        return kind, text_plain, poster_url, meta_lines
+    if soup:
+        img = soup.find("img")
+        if img and img.get("src"):
+            poster_url = img["src"]
+        text_plain = soup.get_text("\n", strip=True)
+        # Remove obvious meta lines to decide if there's review text
+        meta_regex = re.compile(r"\b(Re)?watched on\b", re.I)
+        remaining = "\n".join([ln for ln in text_plain.split("\n") if not meta_regex.search(ln)]).strip()
+        has_review = bool(remaining)
 
-    soup = BeautifulSoup(raw_html, "html.parser")
-
-    # poster: first <img>
-    img = soup.find("img")
-    if img and img.get("src"):
-        poster_url = img["src"]
-
-    # collect text lines
-    text_plain = soup.get_text("\n", strip=True)
-
-    # meta lines (Watched on..., Rewatched on...)
-    for line in text_plain.split("\n"):
-        if re.search(r"\b(Re)?watched on\b", line, flags=re.I):
-            meta_lines.append(line)
-
-    # kind detection — check classes and text
-    soup_has_rewatch_class = any(
-        ("rewatch" in " ".join(tag.get("class", [])).lower())
-        for tag in soup.find_all(True)
-        if tag.get("class")
-    )
-    text_low = text_plain.lower()
-
-    if "/list/" in raw_html or "list" in text_low:
+    # list?
+    url = item.get("url", "") or ""
+    if "/list/" in url and not item.get("lbx_film_title"):
         kind = "list"
-    elif "review" in text_low or "recenz" in text_low:
-        kind = "review"
-    elif "rewatch" in text_low or soup_has_rewatch_class:
-        kind = "rewatch"
-    elif "watched" in text_low or "obejrza" in text_low:
-        kind = "watched"
     else:
-        kind = "activity"
+        # prefer explicit rewatch flag
+        rewatch_val = (item.get("lbx_rewatch") or "").strip().lower()
+        if rewatch_val == "yes":
+            kind = "rewatch"
+        elif rewatch_val == "no":
+            kind = "watched"
+        else:
+            # fallback if flag missing
+            kind = "watched"
 
-    return kind, text_plain, poster_url, meta_lines
+    return kind, text_plain, poster_url, has_review
 
 def summarize_action(kind: str, rating: str | None, has_review: bool) -> str:
     parts = []
-    if kind == "rewatch":
-        parts.append("Rewatched")
-    elif kind == "watched":
-        parts.append("Watched")
-    elif kind == "list":
-        parts.append("Created a list")
-    elif kind == "review":
-        parts.append("Wrote a review")
-    else:
-        parts.append("Activity")
+    parts.append("Rewatched" if kind == "rewatch" else ("Watched" if kind == "watched" else "Created a list" if kind == "list" else "Activity"))
     if rating:
         parts.append(f"Rated {rating}")
-    if has_review and kind not in {"review"}:
+    if has_review:
         parts.append("Review added")
     return " • ".join(parts)
 
 def enrich_item(item):
-    """Attach: kind, text_plain, poster_url, rating, action_summary."""
-    raw_html = item.get("raw_html", "")
-    kind, text_plain, poster_url, meta_lines = detect_kind_and_text(raw_html)
-    rating = parse_rating_from_title(item.get("title"))
+    kind, text_plain, poster_url, has_review = detect_kind_and_text(item)
 
-    # try to infer if there's review text beyond meta lines
-    # remove meta lines from the plain text to see what's left
-    remainder = text_plain
-    for ml in meta_lines:
-        remainder = remainder.replace(ml, "").strip()
-    has_review = len(remainder) > 0
+    # rating: prefer numeric from letterboxd, fallback to stars from title
+    rating = None
+    if item.get("lbx_member_rating"):
+        rating = stars_from_numeric(item["lbx_member_rating"])
+    if not rating:
+        rating = parse_rating_from_title(item.get("title"))
 
     item["poster_url"] = poster_url
     item["kind"] = kind
@@ -177,17 +172,13 @@ def build_email_payload(items_to_send, is_preview):
     html_parts = []
 
     if items_to_send:
-        if is_preview:
-            plain_lines.append(f"Preview of last {len(items_to_send)} activities for {LBX_USER} (not new).")
-            html_parts.append(
-                f"<h2 style='margin:0 0 12px'>Recent activity for {LBX_USER} (preview)</h2>"
-                f"<p style='margin:0 12px 12px 0;color:#555'>No new items today; showing the last {len(items_to_send)} for preview.</p>"
-            )
-        else:
-            plain_lines.append(f"{len(items_to_send)} new activities for {LBX_USER}:")
-            html_parts.append(f"<h2 style='margin:0 0 12px'>New activity for {LBX_USER}</h2>")
+        hdr = "Recent activity" if is_preview else "New activity"
+        sub = (f"No new items today; showing the last {len(items_to_send)} for preview."
+               if is_preview else "")
+        html_parts.append(f"<h2 style='margin:0 0 12px'>{hdr} for {LBX_USER}{' (preview)' if is_preview else ''}</h2>")
+        if sub:
+            html_parts.append(f"<p style='margin:0 0 12px;color:#555'>{sub}</p>")
 
-        # no bullets now
         html_parts.append("<ul style='padding-left:0;margin:0;list-style:none'>")
 
         for it in items_to_send:
@@ -200,7 +191,7 @@ def build_email_payload(items_to_send, is_preview):
             if it.get("has_review"):
                 plain_lines.append(f"  {it.get('text_plain','')}")
 
-            # html block
+            # html
             poster_html = ""
             if it.get("poster_url"):
                 poster_html = (
