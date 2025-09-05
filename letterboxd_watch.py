@@ -13,9 +13,7 @@ GMAIL_USER = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 EMAIL_TO = os.environ["EMAIL_TO"]
 
-# send mail even if no new items
 ALWAYS_EMAIL = os.environ.get("ALWAYS_EMAIL", "1") == "1"
-# how many most-recent items to preview when no new ones
 PREVIEW_LAST_N = int(os.environ.get("PREVIEW_LAST_N", "3"))
 
 STATE_PATH = Path("data/state.json")
@@ -48,13 +46,10 @@ def _entry_html(e):
     return html or ""
 
 def _get_letterboxd_attr(e, name):
-    """
-    feedparser zamienia 'letterboxd:memberRating' -> 'letterboxd_memberrating' (lowercase).
-    """
+    # feedparser maps 'letterboxd:memberRating' -> 'letterboxd_memberrating' (lowercase)
     return getattr(e, f"letterboxd_{name}".lower(), None)
 
 def stars_from_numeric(val_str):
-    """'3.5' -> '★★★½'"""
     try:
         x = float(val_str)
     except Exception:
@@ -72,6 +67,15 @@ def parse_rating_from_title(title: str) -> str | None:
     stars = "".join(ch for ch in title if ch in "★½")
     return stars if stars else None
 
+def strip_rating_from_title(title: str) -> str:
+    if not title:
+        return title
+    # remove trailing " - ★★½" if present
+    parts = title.rsplit(" - ", 1)
+    if len(parts) == 2 and ("★" in parts[1] or "½" in parts[1]):
+        return parts[0]
+    return title
+
 def fetch_items(url):
     feed = feedparser.parse(url)
     items = []
@@ -86,7 +90,7 @@ def fetch_items(url):
             # namespaced fields:
             "lbx_rewatch": _get_letterboxd_attr(e, "rewatch"),               # 'Yes' / 'No'
             "lbx_member_rating": _get_letterboxd_attr(e, "memberrating"),    # e.g. '3.5'
-            "lbx_watched_date": _get_letterboxd_attr(e, "watcheddate"),      # e.g. '2025-09-01'
+            "lbx_watched_date": _get_letterboxd_attr(e, "watcheddate"),      # 'YYYY-MM-DD'
             "lbx_film_title": _get_letterboxd_attr(e, "filmtitle"),
             "lbx_film_year": _get_letterboxd_attr(e, "filmyear"),
         })
@@ -121,14 +125,13 @@ def detect_kind_and_text(item):
     if "/list/" in url and not item.get("lbx_film_title"):
         kind = "list"
     else:
-        # prefer explicit rewatch flag
+        # explicit rewatch flag wins
         rewatch_val = (item.get("lbx_rewatch") or "").strip().lower()
         if rewatch_val == "yes":
             kind = "rewatch"
         elif rewatch_val == "no":
             kind = "watched"
         else:
-            # fallback if flag missing
             kind = "watched"
 
     return kind, text_plain, poster_url, has_review
@@ -143,8 +146,6 @@ def summarize_action(kind: str, rating: str | None, has_review: bool) -> str:
     return " • ".join(parts)
 
 def enrich_item(item):
-    kind, text_plain, poster_url, has_review = detect_kind_and_text(item)
-
     # rating: prefer numeric from letterboxd, fallback to stars from title
     rating = None
     if item.get("lbx_member_rating"):
@@ -152,11 +153,17 @@ def enrich_item(item):
     if not rating:
         rating = parse_rating_from_title(item.get("title"))
 
+    kind, text_plain, poster_url, has_review = detect_kind_and_text(item)
+
+    # clean display title (strip rating suffix if present)
+    display_title = strip_rating_from_title(item.get("title"))
+
     item["poster_url"] = poster_url
     item["kind"] = kind
     item["text_plain"] = text_plain
     item["rating"] = rating
     item["has_review"] = has_review
+    item["display_title"] = display_title
     item["action_summary"] = summarize_action(kind, rating, has_review)
     return item
 
@@ -182,11 +189,14 @@ def build_email_payload(items_to_send, is_preview):
         html_parts.append("<ul style='padding-left:0;margin:0;list-style:none'>")
 
         for it in items_to_send:
-            ts = it["published_at"].strftime("%Y-%m-%d %H:%M UTC") if it["published_at"] else ""
+            ts_event = it["published_at"].strftime("%Y-%m-%d %H:%M UTC") if it["published_at"] else ""
+            watch_date = it.get("lbx_watched_date") or ""
             emoji = {"rewatch":"🔁","watched":"🎬","review":"✍️","list":"📃"}.get(it["kind"], "🎬")
 
             # plain
-            plain_lines.append(f"- {ts} {it['title']} — {it['url']}")
+            plain_lines.append(f"- {ts_event} {it['display_title']} — {it['url']}")
+            if watch_date:
+                plain_lines.append(f"  Watched date: {watch_date}")
             plain_lines.append(f"  {it['action_summary']}")
             if it.get("has_review"):
                 plain_lines.append(f"  {it.get('text_plain','')}")
@@ -204,15 +214,15 @@ def build_email_payload(items_to_send, is_preview):
                         .replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
                 review_html = f"<div style='white-space:pre-wrap;line-height:1.35;margin-top:6px'>{safe}</div>"
 
-            rating_suffix = f" — {it['rating']}" if it.get("rating") else ""
             html_parts.append(
                 "<li style='margin:0 0 16px'>"
                 "<div style='display:flex;gap:12px'>"
                 f"{poster_html}"
                 "<div style='min-width:0'>"
                 f"<div style='font-weight:600;margin-bottom:4px'>{emoji} "
-                f"<a href='{it['url']}' style='color:#0b57d0;text-decoration:none'>{it['title']}</a>{rating_suffix}</div>"
-                f"<div style='color:#555;font-size:13px;margin-bottom:4px'>{ts}</div>"
+                f"<a href='{it['url']}' style='color:#0b57d0;text-decoration:none'>{it['display_title']}</a></div>"
+                f"<div style='color:#555;font-size:13px;margin-bottom:2px'>Event: {ts_event}</div>"
+                f"{(f\"<div style='color:#555;font-size:13px;margin-bottom:6px'>Watched date: {watch_date}</div>\") if watch_date else ''}"
                 f"<div style='color:#222'>{it['action_summary']}</div>"
                 f"{review_html}"
                 "</div>"
