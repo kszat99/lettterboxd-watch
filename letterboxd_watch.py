@@ -188,12 +188,12 @@ def build_email_payload(items_to_send, is_preview):
 
         html_parts.append("<ul style='padding-left:0;margin:0;list-style:none'>")
 
-        for it in items_to_send:
+                for it in items_to_send:
             ts_event = it["published_at"].strftime("%Y-%m-%d %H:%M UTC") if it["published_at"] else ""
             watch_date = it.get("lbx_watched_date") or ""
             emoji = {"rewatch":"🔁","watched":"🎬","review":"✍️","list":"📃"}.get(it["kind"], "🎬")
 
-            # plain
+            # plain text lines
             plain_lines.append(f"- {ts_event} {it['display_title']} — {it['url']}")
             if watch_date:
                 plain_lines.append(f"  Watched date: {watch_date}")
@@ -201,7 +201,7 @@ def build_email_payload(items_to_send, is_preview):
             if it.get("has_review"):
                 plain_lines.append(f"  {it.get('text_plain','')}")
 
-            # html
+            # html helpers
             poster_html = ""
             if it.get("poster_url"):
                 poster_html = (
@@ -214,6 +214,11 @@ def build_email_payload(items_to_send, is_preview):
                         .replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
                 review_html = f"<div style='white-space:pre-wrap;line-height:1.35;margin-top:6px'>{safe}</div>"
 
+            watched_html = (
+                f"<div style='color:#555;font-size:13px;margin-bottom:6px'>Watched date: {watch_date}</div>"
+                if watch_date else ""
+            )
+
             html_parts.append(
                 "<li style='margin:0 0 16px'>"
                 "<div style='display:flex;gap:12px'>"
@@ -222,13 +227,14 @@ def build_email_payload(items_to_send, is_preview):
                 f"<div style='font-weight:600;margin-bottom:4px'>{emoji} "
                 f"<a href='{it['url']}' style='color:#0b57d0;text-decoration:none'>{it['display_title']}</a></div>"
                 f"<div style='color:#555;font-size:13px;margin-bottom:2px'>Event: {ts_event}</div>"
-                f"{(f\"<div style='color:#555;font-size:13px;margin-bottom:6px'>Watched date: {watch_date}</div>\") if watch_date else ''}"
+                f"{watched_html}"
                 f"<div style='color:#222'>{it['action_summary']}</div>"
                 f"{review_html}"
                 "</div>"
                 "</div>"
                 "</li>"
             )
+
 
         html_parts.append("</ul>")
     else:
