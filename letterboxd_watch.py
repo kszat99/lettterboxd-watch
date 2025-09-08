@@ -5,12 +5,15 @@ from datetime import datetime, timezone
 import feedparser
 from bs4 import BeautifulSoup
 
-FEED_URL = os.environ["LBX_FEED_URL"]              #https://letterboxd.com/<user>/rss/
+# --- ENV ---
+FEED_URL = os.environ["LBX_FEED_URL"]              # https://letterboxd.com/<user>/rss/
 LBX_USER = os.environ.get("LBX_USER", "user")
 
 GMAIL_USER = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 EMAIL_TO = os.environ["EMAIL_TO"]
+
+# Snowflake (optional; if any missing, writing is skipped)
 SF_ACCOUNT   = os.environ.get("SNOWFLAKE_ACCOUNT")
 SF_USER      = os.environ.get("SNOWFLAKE_USER")
 SF_PASSWORD  = os.environ.get("SNOWFLAKE_PASSWORD")
@@ -24,6 +27,7 @@ PREVIEW_LAST_N = int(os.environ.get("PREVIEW_LAST_N", "3"))
 
 STATE_PATH = Path("data/state.json")
 
+# --- STATE ---
 def load_state():
     if STATE_PATH.exists():
         with STATE_PATH.open("r", encoding="utf-8") as f:
@@ -35,6 +39,7 @@ def save_state(state):
     with STATE_PATH.open("w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
+# --- helpers ---
 def parse_dt(entry):
     t = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
     if not t:
@@ -53,6 +58,7 @@ def _get_letterboxd_attr(e, name):
     return getattr(e, f"letterboxd_{name}".lower(), None)
 
 def stars_from_numeric(val_str):
+    """'3.5' -> '★★★½'"""
     try:
         x = float(val_str)
     except Exception:
@@ -60,6 +66,14 @@ def stars_from_numeric(val_str):
     full = int(x)
     half = abs(x - full) >= 0.5 - 1e-9
     return "★" * full + ("½" if half else "")
+
+def numeric_from_stars(star_text):
+    """'★★★½' -> 3.5"""
+    if not star_text:
+        return None
+    full = star_text.count("★")
+    half = 0.5 if "½" in star_text else 0.0
+    return full + half
 
 def parse_rating_from_title(title):
     if not title:
@@ -89,9 +103,10 @@ def fetch_items(url):
             "url": getattr(e, "link", ""),
             "published_at": parse_dt(e),
             "raw_html": _entry_html(e),
-            "lbx_rewatch": _get_letterboxd_attr(e, "rewatch"),               # 'Yes' / 'No'
-            "lbx_member_rating": _get_letterboxd_attr(e, "memberrating"),    # e.g., '3.5'
-            "lbx_watched_date": _get_letterboxd_attr(e, "watcheddate"),      # 'YYYY-MM-DD'
+            # namespaced fields:
+            "lbx_rewatch": _get_letterboxd_attr(e, "rewatch"),            # 'Yes' / 'No'
+            "lbx_member_rating": _get_letterboxd_attr(e, "memberrating"), # '3.5'
+            "lbx_watched_date": _get_letterboxd_attr(e, "watcheddate"),   # 'YYYY-MM-DD'
             "lbx_film_title": _get_letterboxd_attr(e, "filmtitle"),
             "lbx_film_year": _get_letterboxd_attr(e, "filmyear"),
         })
@@ -101,7 +116,6 @@ def fetch_items(url):
 def detect_kind_and_text(item):
     """
     Returns (kind, text_plain, poster_url, has_review).
-    kind ∈ {rewatch, watched, list, activity}
     """
     raw_html = item.get("raw_html", "") or ""
     soup = BeautifulSoup(raw_html, "html.parser") if raw_html else None
@@ -120,7 +134,6 @@ def detect_kind_and_text(item):
         has_review = bool(remaining)
 
     url = item.get("url", "") or ""
-
     if "/list/" in url and not item.get("lbx_film_title"):
         kind = "list"
     else:
@@ -134,7 +147,7 @@ def detect_kind_and_text(item):
 
     return kind, text_plain, poster_url, has_review
 
-def summarize_action(kind, rating, has_review):
+def summarize_action(kind, rating_text, has_review):
     parts = []
     if kind == "rewatch":
         parts.append("Rewatched")
@@ -144,32 +157,41 @@ def summarize_action(kind, rating, has_review):
         parts.append("Created a list")
     else:
         parts.append("Activity")
-    if rating:
-        parts.append(f"Rated {rating}")
+    if rating_text:
+        parts.append(f"Rated {rating_text}")
     if has_review:
         parts.append("Review added")
     return " • ".join(parts)
 
 def enrich_item(item):
-    rating = None
+    # Build rating_text (stars) and rating_value (numeric)
+    rating_text = None
+    rating_value = None
     if item.get("lbx_member_rating"):
-        rating = stars_from_numeric(item["lbx_member_rating"])
-    if not rating:
-        rating = parse_rating_from_title(item.get("title"))
+        try:
+            rating_value = float(item["lbx_member_rating"])
+            rating_text = stars_from_numeric(item["lbx_member_rating"])
+        except Exception:
+            rating_value = None
+    if rating_text is None:
+        rating_text = parse_rating_from_title(item.get("title"))
+        if rating_text:
+            rating_value = numeric_from_stars(rating_text)
 
     kind, text_plain, poster_url, has_review = detect_kind_and_text(item)
-
     display_title = strip_rating_from_title(item.get("title"))
 
     item["poster_url"] = poster_url
     item["kind"] = kind
     item["text_plain"] = text_plain
-    item["rating"] = rating
+    item["rating"] = rating_text           # star string for emails
+    item["rating_value"] = rating_value    # numeric for analytics
     item["has_review"] = has_review
     item["display_title"] = display_title
-    item["action_summary"] = summarize_action(kind, rating, has_review)
+    item["action_summary"] = summarize_action(kind, rating_text, has_review)
     return item
 
+# --- email ---
 def build_email_payload(items_to_send, is_preview):
     if items_to_send:
         suffix = " (preview)" if is_preview else ""
@@ -177,24 +199,21 @@ def build_email_payload(items_to_send, is_preview):
     else:
         subject = f"[Letterboxd] {LBX_USER}: no new activity today"
 
-    plain_lines = []
-    html_parts = []
+    plain_lines, html_parts = [], []
 
     if items_to_send:
         header = "Recent activity" if is_preview else "New activity"
         html_parts.append(f"<h2 style='margin:0 0 12px'>{header} for {LBX_USER}{' (preview)' if is_preview else ''}</h2>")
         if is_preview:
-            html_parts.append(
-                f"<p style='margin:0 0 12px;color:#555'>No new items today; showing the last {len(items_to_send)} for preview.</p>"
-            )
+            html_parts.append(f"<p style='margin:0 0 12px;color:#555'>No new items today; showing the last {len(items_to_send)} for preview.</p>")
 
         html_parts.append("<ul style='padding-left:0;margin:0;list-style:none'>")
-
         for it in items_to_send:
             ts_event = it["published_at"].strftime("%Y-%m-%d %H:%M UTC") if it["published_at"] else ""
             watch_date = it.get("lbx_watched_date") or ""
             emoji = {"rewatch":"🔁","watched":"🎬","review":"✍️","list":"📃"}.get(it["kind"], "🎬")
 
+            # plain text
             plain_lines.append(f"- {ts_event} {it['display_title']} — {it['url']}")
             if watch_date:
                 plain_lines.append(f"  Watched date: {watch_date}")
@@ -202,6 +221,7 @@ def build_email_payload(items_to_send, is_preview):
             if it.get("has_review"):
                 plain_lines.append(f"  {it.get('text_plain','')}")
 
+            # html
             poster_html = ""
             if it.get("poster_url"):
                 poster_html = (
@@ -214,10 +234,7 @@ def build_email_payload(items_to_send, is_preview):
                         .replace("&","&amp;").replace("<","&lt;").replace(">","&gt;"))
                 review_html = f"<div style='white-space:pre-wrap;line-height:1.35;margin-top:6px'>{safe}</div>"
 
-            watched_html = (
-                f"<div style='color:#555;font-size:13px;margin-bottom:6px'>Watched date: {watch_date}</div>"
-                if watch_date else ""
-            )
+            watched_html = f"<div style='color:#555;font-size:13px;margin-bottom:6px'>Watched date: {watch_date}</div>" if watch_date else ""
 
             html_parts.append(
                 "<li style='margin:0 0 16px'>"
@@ -234,7 +251,6 @@ def build_email_payload(items_to_send, is_preview):
                 "</div>"
                 "</li>"
             )
-
         html_parts.append("</ul>")
     else:
         plain_lines.append(f"No new activity for {LBX_USER} today.")
@@ -251,20 +267,19 @@ def build_email_payload(items_to_send, is_preview):
 
 def send_email(items_to_send, is_preview):
     subject, plain_text, html_body = build_email_payload(items_to_send, is_preview)
-
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = GMAIL_USER
     msg["To"] = EMAIL_TO
     msg.set_content(plain_text)
     msg.add_alternative(html_body, subtype="html")
-
     ctx = ssl.create_default_context()
     with smtplib.SMTP("smtp.gmail.com", 587) as smtp:
         smtp.starttls(context=ctx)
         smtp.login(GMAIL_USER, GMAIL_APP_PASSWORD)
         smtp.send_message(msg)
 
+# --- Snowflake ---
 def have_snowflake():
     needed = {
         "SNOWFLAKE_ACCOUNT": SF_ACCOUNT,
@@ -280,7 +295,6 @@ def have_snowflake():
         print("[lbx] Snowflake disabled — missing secrets:", ", ".join(missing))
         return False
     return True
-
 
 def write_to_snowflake(user_handle, items, last_seen_new):
     if not have_snowflake():
@@ -301,22 +315,25 @@ def write_to_snowflake(user_handle, items, last_seen_new):
                 ON t.guid = s.guid
                 WHEN MATCHED THEN UPDATE SET
                   user_handle=%s, film_title=%s, film_year=%s, title_raw=%s, url=%s,
-                  kind=%s, rating_text=%s, has_review=%s, published_at=%s, watched_date=%s,
-                  poster_url=%s, action_summary=%s
+                  kind=%s, rating_text=%s, rating_value=%s, has_review=%s,
+                  published_at=%s, watched_date=%s, poster_url=%s, action_summary=%s
                 WHEN NOT MATCHED THEN INSERT (
-                  user_handle, guid, film_title, film_year, title_raw, url, kind, rating_text,
-                  has_review, published_at, watched_date, poster_url, action_summary
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                  user_handle, guid, film_title, film_year, title_raw, url, kind,
+                  rating_text, rating_value, has_review,
+                  published_at, watched_date, poster_url, action_summary
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, (
                 it["guid"],
-                # UPDATE values
-                user_handle, it.get("lbx_film_title"), it.get("lbx_film_year"), it.get("title"), it.get("url"),
-                it.get("kind"), it.get("rating"), bool(it.get("has_review")), it.get("published_at"),
-                it.get("lbx_watched_date"), it.get("poster_url"), it.get("action_summary"),
-                # INSERT values
-                user_handle, it["guid"], it.get("lbx_film_title"), it.get("lbx_film_year"), it.get("title"),
-                it.get("url"), it.get("kind"), it.get("rating"), bool(it.get("has_review")), it.get("published_at"),
-                it.get("lbx_watched_date"), it.get("poster_url"), it.get("action_summary"),
+                # UPDATE values (13)
+                user_handle, it.get("lbx_film_title"), it.get("lbx_film_year"),
+                it.get("display_title"), it.get("url"),
+                it.get("kind"), it.get("rating"), it.get("rating_value"), bool(it.get("has_review")),
+                it.get("published_at"), it.get("lbx_watched_date"), it.get("poster_url"), it.get("action_summary"),
+                # INSERT values (14)
+                user_handle, it["guid"], it.get("lbx_film_title"), it.get("lbx_film_year"),
+                it.get("display_title"), it.get("url"), it.get("kind"),
+                it.get("rating"), it.get("rating_value"), bool(it.get("has_review")),
+                it.get("published_at"), it.get("lbx_watched_date"), it.get("poster_url"), it.get("action_summary"),
             ))
         if last_seen_new:
             cur.execute("""
@@ -335,6 +352,7 @@ def write_to_snowflake(user_handle, items, last_seen_new):
     finally:
         conn.close()
 
+# --- MAIN ---
 def main():
     state = load_state()
     last_seen = datetime.fromisoformat(state["last_seen"]) if state["last_seen"] else None
@@ -343,7 +361,7 @@ def main():
     items = fetch_items(FEED_URL)
     items = [enrich_item(i) for i in items]
 
-    # detect new
+    # detect new for email
     new_items = []
     for i in items:
         if i["published_at"] and (not last_seen or i["published_at"] > last_seen):
@@ -359,7 +377,13 @@ def main():
         elif ALWAYS_EMAIL:
             send_email([], is_preview=False)
 
+    # update watermark in JSON (clamp to now if feed is ahead)
     newest_ts = next((i["published_at"] for i in items if i["published_at"]), last_seen)
+    now_utc = datetime.now(timezone.utc)
+    if newest_ts and newest_ts > now_utc:
+        print(f"[lbx] note: newest_ts {newest_ts} > now {now_utc}; clamping to now")
+        newest_ts = now_utc
+
     if newest_ts:
         state["last_seen"] = newest_ts.isoformat()
     for i in items:
@@ -367,8 +391,9 @@ def main():
             seen_guids.add(i["guid"])
     state["seen_guids"] = list(seen_guids)[-4000:]
     save_state(state)
-    write_to_snowflake(LBX_USER, items, newest_ts)
 
+    # write to Snowflake (idempotent MERGE by guid)
+    write_to_snowflake(LBX_USER, items, newest_ts)
 
 if __name__ == "__main__":
     main()
