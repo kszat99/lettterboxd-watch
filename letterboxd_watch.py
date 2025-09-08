@@ -310,31 +310,36 @@ def write_to_snowflake(user_handle, items, last_seen_new):
         print("[lbx] Snowflake: connected")
         for it in items:
             cur.execute("""
-                MERGE INTO LETTERBOXD_ACTIVITY t
-                USING (SELECT %s AS guid) s
-                ON t.guid = s.guid
-                WHEN MATCHED THEN UPDATE SET
-                  user_handle=%s, film_title=%s, film_year=%s, title_raw=%s, url=%s,
-                  kind=%s, rating_text=%s, rating_value=%s, has_review=%s,
-                  published_at=%s, watched_date=%s, poster_url=%s, action_summary=%s
-                WHEN NOT MATCHED THEN INSERT (
-                  user_handle, guid, film_title, film_year, title_raw, url, kind,
-                  rating_text, rating_value, has_review,
-                  published_at, watched_date, poster_url, action_summary
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            """, (
-                it["guid"],
-                # UPDATE values (13)
-                user_handle, it.get("lbx_film_title"), it.get("lbx_film_year"),
-                it.get("display_title"), it.get("url"),
-                it.get("kind"), it.get("rating"), it.get("rating_value"), bool(it.get("has_review")),
-                it.get("published_at"), it.get("lbx_watched_date"), it.get("poster_url"), it.get("action_summary"),
-                # INSERT values (14)
-                user_handle, it["guid"], it.get("lbx_film_title"), it.get("lbx_film_year"),
-                it.get("display_title"), it.get("url"), it.get("kind"),
-                it.get("rating"), it.get("rating_value"), bool(it.get("has_review")),
-                it.get("published_at"), it.get("lbx_watched_date"), it.get("poster_url"), it.get("action_summary"),
-            ))
+    MERGE INTO LETTERBOXD_ACTIVITY t
+    USING (SELECT %s AS guid) s
+    ON t.guid = s.guid
+    WHEN MATCHED THEN UPDATE SET
+      user_handle=%s, film_title=%s, film_year=%s, title_raw=%s, url=%s,
+      kind=%s, rating_text=%s, rating_value=%s, has_review=%s,
+      published_at=%s, watched_date=%s, poster_url=%s, action_summary=%s
+    WHEN NOT MATCHED THEN INSERT (
+      user_handle, guid, film_title, film_year, title_raw, url, kind,
+      rating_text, rating_value, has_review,
+      published_at, watched_date, poster_url, action_summary, fetched_at
+    ) VALUES (
+      %s,%s,%s,%s,%s,%s,%s,
+      %s,%s,%s,
+      %s,%s,%s,%s, CURRENT_TIMESTAMP()
+    )
+""", (
+    it["guid"],
+    # UPDATE values
+    user_handle, it.get("lbx_film_title"), it.get("lbx_film_year"),
+    it.get("lbx_film_title"), it.get("url"),
+    it.get("kind"), it.get("rating"), it.get("rating_value"), bool(it.get("has_review")),
+    it.get("published_at"), it.get("lbx_watched_date"), it.get("poster_url"), it.get("action_summary"),
+    # INSERT values
+    user_handle, it["guid"], it.get("lbx_film_title"), it.get("lbx_film_year"),
+    it.get("lbx_film_title"), it.get("url"), it.get("kind"),
+    it.get("rating"), it.get("rating_value"), bool(it.get("has_review")),
+    it.get("published_at"), it.get("lbx_watched_date"), it.get("poster_url"), it.get("action_summary"),
+))
+
         if last_seen_new:
             cur.execute("""
                 MERGE INTO LETTERBOXD_WATERMARK t
