@@ -11,6 +11,13 @@ LBX_USER = os.environ.get("LBX_USER", "user")
 GMAIL_USER = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 EMAIL_TO = os.environ["EMAIL_TO"]
+SF_ACCOUNT   = os.environ.get("SNOWFLAKE_ACCOUNT")
+SF_USER      = os.environ.get("SNOWFLAKE_USER")
+SF_PASSWORD  = os.environ.get("SNOWFLAKE_PASSWORD")
+SF_ROLE      = os.environ.get("SNOWFLAKE_ROLE")
+SF_DATABASE  = os.environ.get("SNOWFLAKE_DATABASE")
+SF_SCHEMA    = os.environ.get("SNOWFLAKE_SCHEMA")
+SF_WAREHOUSE = os.environ.get("SNOWFLAKE_WAREHOUSE")
 
 ALWAYS_EMAIL = os.environ.get("ALWAYS_EMAIL", "1") == "1"
 PREVIEW_LAST_N = int(os.environ.get("PREVIEW_LAST_N", "3"))
@@ -258,6 +265,76 @@ def send_email(items_to_send, is_preview):
         smtp.login(GMAIL_USER, GMAIL_APP_PASSWORD)
         smtp.send_message(msg)
 
+def have_snowflake():
+    needed = {
+        "SNOWFLAKE_ACCOUNT": SF_ACCOUNT,
+        "SNOWFLAKE_USER": SF_USER,
+        "SNOWFLAKE_PASSWORD": SF_PASSWORD,
+        "SNOWFLAKE_ROLE": SF_ROLE,
+        "SNOWFLAKE_DATABASE": SF_DATABASE,
+        "SNOWFLAKE_SCHEMA": SF_SCHEMA,
+        "SNOWFLAKE_WAREHOUSE": SF_WAREHOUSE,
+    }
+    missing = [k for k, v in needed.items() if not v]
+    if missing:
+        print("[lbx] Snowflake disabled — missing secrets:", ", ".join(missing))
+        return False
+    return True
+
+
+def write_to_snowflake(user_handle, items, last_seen_new):
+    if not have_snowflake():
+        return
+    print(f"[lbx] Snowflake: writing {len(items)} items (watermark={last_seen_new})")
+    import snowflake.connector
+    conn = snowflake.connector.connect(
+        account=SF_ACCOUNT, user=SF_USER, password=SF_PASSWORD,
+        role=SF_ROLE, warehouse=SF_WAREHOUSE, database=SF_DATABASE, schema=SF_SCHEMA
+    )
+    try:
+        cur = conn.cursor()
+        print("[lbx] Snowflake: connected")
+        for it in items:
+            cur.execute("""
+                MERGE INTO LETTERBOXD_ACTIVITY t
+                USING (SELECT %s AS guid) s
+                ON t.guid = s.guid
+                WHEN MATCHED THEN UPDATE SET
+                  user_handle=%s, film_title=%s, film_year=%s, title_raw=%s, url=%s,
+                  kind=%s, rating_text=%s, has_review=%s, published_at=%s, watched_date=%s,
+                  poster_url=%s, action_summary=%s
+                WHEN NOT MATCHED THEN INSERT (
+                  user_handle, guid, film_title, film_year, title_raw, url, kind, rating_text,
+                  has_review, published_at, watched_date, poster_url, action_summary
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                it["guid"],
+                # UPDATE values
+                user_handle, it.get("lbx_film_title"), it.get("lbx_film_year"), it.get("title"), it.get("url"),
+                it.get("kind"), it.get("rating"), bool(it.get("has_review")), it.get("published_at"),
+                it.get("lbx_watched_date"), it.get("poster_url"), it.get("action_summary"),
+                # INSERT values
+                user_handle, it["guid"], it.get("lbx_film_title"), it.get("lbx_film_year"), it.get("title"),
+                it.get("url"), it.get("kind"), it.get("rating"), bool(it.get("has_review")), it.get("published_at"),
+                it.get("lbx_watched_date"), it.get("poster_url"), it.get("action_summary"),
+            ))
+        if last_seen_new:
+            cur.execute("""
+                MERGE INTO LETTERBOXD_WATERMARK t
+                USING (SELECT %s AS user_handle, %s::TIMESTAMP_TZ AS last_seen) s
+                ON t.user_handle = s.user_handle
+                WHEN MATCHED THEN UPDATE SET last_seen = s.last_seen
+                WHEN NOT MATCHED THEN INSERT (user_handle, last_seen) VALUES (s.user_handle, s.last_seen)
+            """, (user_handle, last_seen_new))
+        conn.commit()
+        cur.close()
+        print("[lbx] Snowflake: done")
+    except Exception as e:
+        print("[lbx] Snowflake ERROR:", repr(e))
+        raise
+    finally:
+        conn.close()
+
 def main():
     state = load_state()
     last_seen = datetime.fromisoformat(state["last_seen"]) if state["last_seen"] else None
@@ -290,6 +367,8 @@ def main():
             seen_guids.add(i["guid"])
     state["seen_guids"] = list(seen_guids)[-4000:]
     save_state(state)
+    write_to_snowflake(LBX_USER, items, newest_ts)
+
 
 if __name__ == "__main__":
     main()
